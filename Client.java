@@ -602,6 +602,7 @@ public class Client extends JFrame {
 
             SSLSocketFactory ssf = sc.getSocketFactory();
             socket = (SSLSocket) ssf.createSocket("tcp.cloudpub.ru", 62035);
+            socket.setKeepAlive(true);
 
             in = new DataInputStream(socket.getInputStream());
             out = new DataOutputStream(socket.getOutputStream());
@@ -1379,138 +1380,114 @@ public class Client extends JFrame {
         }
     }
 
-    private void listen() {
-        try {
-            while (true) {
-                String type = in.readUTF();
+   private void listen() {
+    // Запускаем поток для пинга один раз
+    new Thread(() -> {
+        while (true) {
+            try {
+                Thread.sleep(35000);
+                if (out != null) {
+                    out.writeUTF("PING");
+                    out.flush();
+                }
+            } catch (Exception e) {
+                break;
+            }
+        }
+    }).start();
 
-                if (type.equals("MSG")) {
-                    in.readUTF();
-                    in.readUTF();
+    try {
+        while (true) {
+            String type = in.readUTF();
+
+            // ✅ Обработка PONG — просто игнорируем, но сбрасываем таймауты
+            if (type.equals("PONG")) {
+                continue;
+            }
+
+            if (type.equals("MSG")) {
+                in.readUTF();
+                in.readUTF();
+                continue;
+            } else if (type.equals("PRIVATE")) {
+                String senderId = in.readUTF();
+                String recipientId = in.readUTF();
+                String text = in.readUTF();
+                String otherId = senderId.equals(selfUserId) ? recipientId : senderId;
+                if (otherId != null && otherId.equals(currentChatId)) {
+                    if (senderId.equals(selfUserId)) {
+                        chatArea.append("[PM] you -> " + displayNameForId(otherId) + ": " + text + "\n");
+                    } else {
+                        chatArea.append("[PM] " + displayNameForId(otherId) + " -> you: " + text + "\n");
+                    }
+                }
+                if (!senderId.equals(selfUserId)) {
+                    playMessageReceivedSound();
+                }
+            } else if (type.equals("CHAT_HISTORY")) {
+                int count = in.readInt();
+                chatArea.setText("");
+                String header = currentChatId == null ? "Чат" : displayNameForId(currentChatId);
+                chatArea.append("---- " + header + " ----\n");
+                for (int i = 0; i < count; i++) {
+                    chatArea.append(in.readUTF() + "\n");
+                }
+                chatArea.append("----------------------\n");
+            } else if (type.equals("Ошибка загрузки")) {
+                JOptionPane.showMessageDialog(this, "Файл не найден");
+            } else if (type.equals("SERVER_FILES_LIST")) {
+                int count = in.readInt();
+                if (count == 0) {
+                    JOptionPane.showMessageDialog(this, "Нет файлов на сервере");
                     continue;
-                } else if (type.equals("PRIVATE")) {
-                    String senderId = in.readUTF();
-                    String recipientId = in.readUTF();
-                    String text = in.readUTF();
-                    String otherId = senderId.equals(selfUserId) ? recipientId : senderId;
-                    if (otherId != null && otherId.equals(currentChatId)) {
-                        if (senderId.equals(selfUserId)) {
-                            chatArea.append("[PM] you -> " + displayNameForId(otherId) + ": " + text + "\n");
-                        } else {
-                            chatArea.append("[PM] " + displayNameForId(otherId) + " -> you: " + text + "\n");
-                        }
-                    }
-                    // Play sound for received message (only if not sent by current user)
-                    if (!senderId.equals(selfUserId)) {
-                        playMessageReceivedSound();
-                    }
-                } else if (type.equals("CHAT_HISTORY")) {
-                    int count = in.readInt();
-                    chatArea.setText("");
-                    String header = currentChatId == null ? "Чат" : displayNameForId(currentChatId);
-                    chatArea.append("---- " + header + " ----\n");
-                    for (int i = 0; i < count; i++) {
-                        chatArea.append(in.readUTF() + "\n");
-                    }
-                    chatArea.append("----------------------\n");
-                } else if (type.equals("Ошибка загрузки")) {
-                    JOptionPane.showMessageDialog(this, "Файл не найден");
-                } else if (type.equals("SERVER_FILES_LIST")) {
-                    int count = in.readInt();
-                    if (count == 0) {
-                        JOptionPane.showMessageDialog(this, "Нет файлов на сервере");
-                        continue;
-                    }
-                    String[] files = new String[count];
-                    for (int i = 0; i < count; i++) {
-                        files[i] = in.readUTF();
-                    }
-                    String selected = (String) JOptionPane.showInputDialog(
-                            this,
-                            "Выберите файлы для скачивания:",
-                            "Файлы сервера",
-                            JOptionPane.PLAIN_MESSAGE,
-                            null,
-                            files,
-                            files[0]
-                    );
-                    if (selected != null) {
-                        sendCommand(stream -> {
-                            stream.writeUTF("DOWNLOAD_FILE");
-                            stream.writeUTF(selected);
-                        });
-                    }
-                } else if (type.equals("DOWNLOAD_FILE")) {
-                    String fileName = in.readUTF();
-                    long size = in.readLong();
-                    byte[] data = new byte[(int) size];
-                    in.readFully(data);
-                    File file = new File(downloadsDir, fileName);
-                    try (FileOutputStream fos = new FileOutputStream(file)) {
-                        fos.write(data);
-                    }
-                    JOptionPane.showMessageDialog(this,
-                            "Скачено: " + file.getName());
-                } else if (type.equals("DOWNLOAD_FAILED")) {
-                    JOptionPane.showMessageDialog(this, "Файл не найден");
-                } else if (type.equals("FILE")) {
-                    String sender = in.readUTF();
-                    String fileName = in.readUTF();
-                    long size = in.readLong();
-                    byte[] data = new byte[(int) size];
-                    in.readFully(data);
-                    File file =
-                            new File(downloadsDir, sender + "_" + fileName);
-                    try (FileOutputStream fos = new FileOutputStream(file)) {
-                        fos.write(data);
-                    }
-                    chatArea.append(sender + " sent file: " + file.getName() + "\n");
-                } else if (type.equals("USERS_LIST")) {
-                    int count = in.readInt();
-                    for (int i = 0; i < count; i++) {
-                        String id = in.readUTF();
-                        String name = in.readUTF();
-                        String status = in.readUTF();
-                        userStatuses.put(id, status);
-                        if (name != null && !name.isEmpty()) {
-                            userNamesById.put(id, name);
-                        }
-                    }
-                    rebuildUsersList();
-                } else if (type.equals("CONVERSATIONS_LIST")) {
-                    int count = in.readInt();
-                    conversationNamesById.clear();
-                    conversationCreatorsById.clear();
-                    for (int i = 0; i < count; i++) {
-                        String id = in.readUTF();
-                        String name = in.readUTF();
-                        String creator = in.readUTF();
-                        if (id == null || id.trim().isEmpty()) {
-                            continue;
-                        }
-                        String normalizedId = normalizeConversationId(id);
-                        conversationNamesById.put(normalizedId, name == null ? normalizedId : name);
-                        if (creator != null && !creator.isEmpty()) {
-                            conversationCreatorsById.put(normalizedId, creator);
-                        }
-                    }
-                    rebuildUsersList();
-                    updateConversationControls();
-                } else if (type.equals("FRIENDS_LIST")) {
-                    int count = in.readInt();
-                    friends.clear();
-                    for (int i = 0; i < count; i++) {
-                        String id = in.readUTF();
-                        String name = in.readUTF();
-                        String status = in.readUTF();
-                        friends.add(id);
-                        userStatuses.put(id, status);
-                        if (name != null && !name.isEmpty()) {
-                            userNamesById.put(id, name);
-                        }
-                    }
-                    rebuildUsersList();
-                } else if (type.equals("STATUS_UPDATE")) {
+                }
+                String[] files = new String[count];
+                for (int i = 0; i < count; i++) {
+                    files[i] = in.readUTF();
+                }
+                String selected = (String) JOptionPane.showInputDialog(
+                        this,
+                        "Выберите файлы для скачивания:",
+                        "Файлы сервера",
+                        JOptionPane.PLAIN_MESSAGE,
+                        null,
+                        files,
+                        files[0]
+                );
+                if (selected != null) {
+                    sendCommand(stream -> {
+                        stream.writeUTF("DOWNLOAD_FILE");
+                        stream.writeUTF(selected);
+                    });
+                }
+            } else if (type.equals("DOWNLOAD_FILE")) {
+                String fileName = in.readUTF();
+                long size = in.readLong();
+                byte[] data = new byte[(int) size];
+                in.readFully(data);
+                File file = new File(downloadsDir, fileName);
+                try (FileOutputStream fos = new FileOutputStream(file)) {
+                    fos.write(data);
+                }
+                JOptionPane.showMessageDialog(this,
+                        "Скачено: " + file.getName());
+            } else if (type.equals("DOWNLOAD_FAILED")) {
+                JOptionPane.showMessageDialog(this, "Файл не найден");
+            } else if (type.equals("FILE")) {
+                String sender = in.readUTF();
+                String fileName = in.readUTF();
+                long size = in.readLong();
+                byte[] data = new byte[(int) size];
+                in.readFully(data);
+                File file =
+                        new File(downloadsDir, sender + "_" + fileName);
+                try (FileOutputStream fos = new FileOutputStream(file)) {
+                    fos.write(data);
+                }
+                chatArea.append(sender + " sent file: " + file.getName() + "\n");
+            } else if (type.equals("USERS_LIST")) {
+                int count = in.readInt();
+                for (int i = 0; i < count; i++) {
                     String id = in.readUTF();
                     String name = in.readUTF();
                     String status = in.readUTF();
@@ -1518,134 +1495,187 @@ public class Client extends JFrame {
                     if (name != null && !name.isEmpty()) {
                         userNamesById.put(id, name);
                     }
-                    chatArea.append("[status] " + displayNameForId(id) + " is " + status.toLowerCase() + "\n");
-                    rebuildUsersList();
-                } else if (type.equals("CONVERSATION_CREATED")) {
+                }
+                rebuildUsersList();
+            } else if (type.equals("CONVERSATIONS_LIST")) {
+                int count = in.readInt();
+                conversationNamesById.clear();
+                conversationCreatorsById.clear();
+                for (int i = 0; i < count; i++) {
                     String id = in.readUTF();
                     String name = in.readUTF();
                     String creator = in.readUTF();
+                    if (id == null || id.trim().isEmpty()) {
+                        continue;
+                    }
                     String normalizedId = normalizeConversationId(id);
                     conversationNamesById.put(normalizedId, name == null ? normalizedId : name);
                     if (creator != null && !creator.isEmpty()) {
                         conversationCreatorsById.put(normalizedId, creator);
                     }
-                    rebuildUsersList();
-                    setActiveChat(normalizedId);
-                } else if (type.equals("CONVERSATION_ADDED")) {
+                }
+                rebuildUsersList();
+                updateConversationControls();
+            } else if (type.equals("FRIENDS_LIST")) {
+                int count = in.readInt();
+                friends.clear();
+                for (int i = 0; i < count; i++) {
                     String id = in.readUTF();
                     String name = in.readUTF();
-                    String creator = in.readUTF();
-                    String normalizedId = normalizeConversationId(id);
-                    conversationNamesById.put(normalizedId, name == null ? normalizedId : name);
-                    if (creator != null && !creator.isEmpty()) {
-                        conversationCreatorsById.put(normalizedId, creator);
-                    }
-                    rebuildUsersList();
-                    JOptionPane.showMessageDialog(this,
-                            "Вас добавили в беседу: " + displayNameForId(normalizedId));
-                } else if (type.equals("CONVERSATION_NAME_UPDATED")) {
-                    String id = in.readUTF();
-                    String newName = in.readUTF();
-                    String normalizedId = normalizeConversationId(id);
-                    if (newName != null && !newName.trim().isEmpty()) {
-                        conversationNamesById.put(normalizedId, newName);
-                    }
-                    rebuildUsersList();
-                    if (currentChatId != null && currentChatId.equals(normalizedId)) {
-                        requestChatHistory(normalizedId);
-                    }
-                } else if (type.equals("CONVERSATION_MSG")) {
-                    String conversationId = normalizeConversationId(in.readUTF());
-                    String senderId = in.readUTF();
-                    String text = in.readUTF();
-                    if (conversationId != null && conversationId.equals(currentChatId)) {
-                        chatArea.append(displayNameForId(senderId) + ": " + text + "\n");
-                    }
-                    // Play sound for received conversation message (only if not sent by current user)
-                    if (!senderId.equals(selfUserId)) {
-                        playMessageReceivedSound();
-                    }
-                } else if (type.equals("CONVERSATION_HISTORY")) {
-                    String conversationId = normalizeConversationId(in.readUTF());
-                    int count = in.readInt();
-                    if (conversationId != null && conversationId.equals(currentChatId)) {
-                        chatArea.setText("");
-                        String header = displayNameForId(conversationId);
-                        chatArea.append("---- " + header + " ----\n");
-                        for (int i = 0; i < count; i++) {
-                            chatArea.append(in.readUTF() + "\n");
-                        }
-                        chatArea.append("----------------------\n");
-                    } else {
-                        for (int i = 0; i < count; i++) {
-                            in.readUTF();
-                        }
-                    }
-                } else if (type.equals("CONVERSATION_FAILED")) {
-                    String reason = in.readUTF();
-                    JOptionPane.showMessageDialog(this, reason);
-                } else if (type.equals("FRIEND_ADDED")) {
-                    String id = in.readUTF();
-                    String name = in.readUTF();
+                    String status = in.readUTF();
                     friends.add(id);
+                    userStatuses.put(id, status);
                     if (name != null && !name.isEmpty()) {
                         userNamesById.put(id, name);
                     }
-                    userStatuses.putIfAbsent(id, "OFFLINE");
-                    rebuildUsersList();
-                    JOptionPane.showMessageDialog(this,
-                            "Добавлен в друзья: " + displayNameForId(id));
-                } else if (type.equals("FRIEND_FAILED")) {
-                    String reason = in.readUTF();
-                    JOptionPane.showMessageDialog(this, reason);
-                } else if (type.equals("AUDIO_FRAME")) {
-                    int length = in.readInt();
-                    byte[] audio = new byte[length];
-                    in.readFully(audio);
-                    playAudio(audio, length);
-                } else if (type.equals("CALL_INVITE")) {
-                    String caller = in.readUTF();
-                    handleIncomingCall(caller);
-                } else if (type.equals("CALL_ESTABLISHED")) {
-                    String peer = in.readUTF();
-                    activeCallPeer = peer;
-                    openCallWindow(peer);
-                    chatArea.append("Звонок с " + displayNameForId(peer) + " начат\n");
-                } else if (type.equals("CALL_ENDED")) {
-                    String peer = in.readUTF();
-                    stopAudioStreams();
-                    closeCallWindow();
-                    chatArea.append("Звонок с " + displayNameForId(peer) + " завершён\n");
-                } else if (type.equals("CALL_DECLINED")) {
-                    String peer = in.readUTF();
-                    chatArea.append(displayNameForId(peer) + " отклонил звонок\n");
-                    activeCallPeer = null;
-                } else if (type.equals("CALL_BUSY")) {
-                    String peer = in.readUTF();
-                    chatArea.append(displayNameForId(peer) + " занят\n");
-                    activeCallPeer = null;
-                } else if (type.equals("PRIVATE_FAILED")) {
-                    String reason = in.readUTF();
-                    JOptionPane.showMessageDialog(this, reason);
                 }
+                rebuildUsersList();
+            } else if (type.equals("STATUS_UPDATE")) {
+                String id = in.readUTF();
+                String name = in.readUTF();
+                String status = in.readUTF();
+                userStatuses.put(id, status);
+                if (name != null && !name.isEmpty()) {
+                    userNamesById.put(id, name);
+                }
+                chatArea.append("[status] " + displayNameForId(id) + " is " + status.toLowerCase() + "\n");
+                rebuildUsersList();
+            } else if (type.equals("CONVERSATION_CREATED")) {
+                String id = in.readUTF();
+                String name = in.readUTF();
+                String creator = in.readUTF();
+                String normalizedId = normalizeConversationId(id);
+                conversationNamesById.put(normalizedId, name == null ? normalizedId : name);
+                if (creator != null && !creator.isEmpty()) {
+                    conversationCreatorsById.put(normalizedId, creator);
+                }
+                rebuildUsersList();
+                setActiveChat(normalizedId);
+            } else if (type.equals("CONVERSATION_ADDED")) {
+                String id = in.readUTF();
+                String name = in.readUTF();
+                String creator = in.readUTF();
+                String normalizedId = normalizeConversationId(id);
+                conversationNamesById.put(normalizedId, name == null ? normalizedId : name);
+                if (creator != null && !creator.isEmpty()) {
+                    conversationCreatorsById.put(normalizedId, creator);
+                }
+                rebuildUsersList();
+                JOptionPane.showMessageDialog(this,
+                        "Вас добавили в беседу: " + displayNameForId(normalizedId));
+            } else if (type.equals("CONVERSATION_NAME_UPDATED")) {
+                String id = in.readUTF();
+                String newName = in.readUTF();
+                String normalizedId = normalizeConversationId(id);
+                if (newName != null && !newName.trim().isEmpty()) {
+                    conversationNamesById.put(normalizedId, newName);
+                }
+                rebuildUsersList();
+                if (currentChatId != null && currentChatId.equals(normalizedId)) {
+                    requestChatHistory(normalizedId);
+                }
+            } else if (type.equals("CONVERSATION_MSG")) {
+                String conversationId = normalizeConversationId(in.readUTF());
+                String senderId = in.readUTF();
+                String text = in.readUTF();
+                if (conversationId != null && conversationId.equals(currentChatId)) {
+                    chatArea.append(displayNameForId(senderId) + ": " + text + "\n");
+                }
+                if (!senderId.equals(selfUserId)) {
+                    playMessageReceivedSound();
+                }
+            } else if (type.equals("CONVERSATION_HISTORY")) {
+                String conversationId = normalizeConversationId(in.readUTF());
+                int count = in.readInt();
+                if (conversationId != null && conversationId.equals(currentChatId)) {
+                    chatArea.setText("");
+                    String header = displayNameForId(conversationId);
+                    chatArea.append("---- " + header + " ----\n");
+                    for (int i = 0; i < count; i++) {
+                        chatArea.append(in.readUTF() + "\n");
+                    }
+                    chatArea.append("----------------------\n");
+                } else {
+                    for (int i = 0; i < count; i++) {
+                        in.readUTF();
+                    }
+                }
+            } else if (type.equals("CONVERSATION_FAILED")) {
+                String reason = in.readUTF();
+                JOptionPane.showMessageDialog(this, reason);
+            } else if (type.equals("FRIEND_ADDED")) {
+                String id = in.readUTF();
+                String name = in.readUTF();
+                friends.add(id);
+                if (name != null && !name.isEmpty()) {
+                    userNamesById.put(id, name);
+                }
+                userStatuses.putIfAbsent(id, "OFFLINE");
+                rebuildUsersList();
+                JOptionPane.showMessageDialog(this,
+                        "Добавлен в друзья: " + displayNameForId(id));
+            } else if (type.equals("FRIEND_FAILED")) {
+                String reason = in.readUTF();
+                JOptionPane.showMessageDialog(this, reason);
+            } else if (type.equals("AUDIO_FRAME")) {
+                int length = in.readInt();
+                byte[] audio = new byte[length];
+                in.readFully(audio);
+                playAudio(audio, length);
+            } else if (type.equals("CALL_INVITE")) {
+                String caller = in.readUTF();
+                handleIncomingCall(caller);
+            } else if (type.equals("CALL_ESTABLISHED")) {
+                String peer = in.readUTF();
+                activeCallPeer = peer;
+                openCallWindow(peer);
+                chatArea.append("Звонок с " + displayNameForId(peer) + " начат\n");
+            } else if (type.equals("CALL_ENDED")) {
+                String peer = in.readUTF();
+                stopAudioStreams();
+                closeCallWindow();
+                chatArea.append("Звонок с " + displayNameForId(peer) + " завершён\n");
+            } else if (type.equals("CALL_DECLINED")) {
+                String peer = in.readUTF();
+                chatArea.append(displayNameForId(peer) + " отклонил звонок\n");
+                activeCallPeer = null;
+            } else if (type.equals("CALL_BUSY")) {
+                String peer = in.readUTF();
+                chatArea.append(displayNameForId(peer) + " занят\n");
+                activeCallPeer = null;
+            } else if (type.equals("PRIVATE_FAILED")) {
+                String reason = in.readUTF();
+                JOptionPane.showMessageDialog(this, reason);
             }
-        } catch (Exception e) {
-            chatArea.append("Отключено\n");
-            updateStatusLabel(false);
-            setControlsEnabled(false);
-            downloadBtn.setEnabled(false);
-            loginBtn.setEnabled(true);
-            userNamesById.clear();
-            userStatuses.clear();
-            friends.clear();
-            pinnedChats.clear();
-            conversationNamesById.clear();
-            conversationCreatorsById.clear();
-            rebuildUsersList();
-            updatePinButton();
-            updateConversationControls();
         }
+    } catch (Exception e) {
+        chatArea.append("Отключено\n");
+        updateStatusLabel(false);
+        setControlsEnabled(false);
+        downloadBtn.setEnabled(false);
+        loginBtn.setEnabled(true);
+        userNamesById.clear();
+        userStatuses.clear();
+        friends.clear();
+        pinnedChats.clear();
+        conversationNamesById.clear();
+        conversationCreatorsById.clear();
+        rebuildUsersList();
+        updatePinButton();
+        updateConversationControls();
+
+        // автоматическое переп. через 5 секунд
+        new Thread(() -> {
+            try {
+                Thread.sleep(5000);
+                SwingUtilities.invokeLater(() -> {
+                    chatArea.append("Попытка переподключения...\n");
+                    showAuthDialog();
+                });
+            } catch (InterruptedException ignored) {}
+        }).start();
     }
+}
 
     public static void main(String[] args) {
         try {
