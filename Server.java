@@ -1,5 +1,6 @@
 import java.io.*;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.security.KeyPair;
 import java.security.KeyStore;
 import java.security.PrivateKey;
@@ -11,6 +12,10 @@ import javax.net.ssl.*;
 import javax.swing.*;
 
 public class Server extends JFrame {
+    private static final int FILE_IO_BUFFER_SIZE = 64 * 1024;
+    private static final int SOCKET_IDLE_CHECK_MS = 30_000;
+    private static final long CLIENT_STALE_TIMEOUT_MS = 90_000L;
+    private static final long MAX_INCOMING_FILE_BYTES = 2L * 1024 * 1024 * 1024;
 
     private final JTextArea logArea = new JTextArea();
     private SSLServerSocket serverSocket;
@@ -533,6 +538,49 @@ public class Server extends JFrame {
         }
     }
 
+    private String normalizeIncomingFileName(String fileName) {
+        if (fileName == null || fileName.trim().isEmpty()) {
+            return null;
+        }
+        String base = new File(fileName).getName();
+        if (!base.equals(fileName)) {
+            return null;
+        }
+        base = base.replace('\n', '_').replace('\r', '_').trim();
+        if (base.isEmpty()) {
+            return null;
+        }
+        return base;
+    }
+
+    private void transferFixedBytes(InputStream source, OutputStream destination, long size) throws IOException {
+        byte[] buffer = new byte[FILE_IO_BUFFER_SIZE];
+        long remaining = size;
+        while (remaining > 0) {
+            int read = source.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+            if (read < 0) {
+                throw new EOFException("Unexpected end of stream");
+            }
+            destination.write(buffer, 0, read);
+            remaining -= read;
+        }
+    }
+
+    private void skipIncomingBytes(InputStream source, long size) throws IOException {
+        if (size <= 0) {
+            return;
+        }
+        byte[] buffer = new byte[FILE_IO_BUFFER_SIZE];
+        long remaining = size;
+        while (remaining > 0) {
+            int read = source.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+            if (read < 0) {
+                throw new EOFException("Unexpected end of stream while skipping payload");
+            }
+            remaining -= read;
+        }
+    }
+
     private void sendFriendsList(ClientHandler handler) {
         if (handler == null || handler.userId == null) return;
         java.util.List<String> friends = getFriends(handler.userId);
@@ -593,7 +641,7 @@ public class Server extends JFrame {
         private String userId;
         private boolean registered = false;
         private final Object outLock = new Object();
-
+        
         ClientHandler(Socket socket) {
             this.socket = socket;
         }
@@ -611,12 +659,15 @@ public class Server extends JFrame {
         public void run() {
             try {
 
-                in = new DataInputStream(socket.getInputStream());
-                out = new DataOutputStream(socket.getOutputStream());
+                in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), FILE_IO_BUFFER_SIZE));
+                out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), FILE_IO_BUFFER_SIZE));
 
                 socket.setKeepAlive(true);
+                socket.setSoTimeout(SOCKET_IDLE_CHECK_MS);
+                socket.setTcpNoDelay(true);
 
                 String action = in.readUTF();
+                
                 if ("REGISTER".equals(action)) {
                     String user = in.readUTF();
                     String pass = in.readUTF();
@@ -704,15 +755,31 @@ public class Server extends JFrame {
                 sendConversationsList(this);
 
                 log(username + " connected");
+                long lastPacketAtMs = System.currentTimeMillis();
 
                 while (true) {
-                    String type = in.readUTF();
+                    String type;
+                    try {
+                        type = in.readUTF();
+                        lastPacketAtMs = System.currentTimeMillis();
+                    } catch (SocketTimeoutException timeout) {
+                        if (System.currentTimeMillis() - lastPacketAtMs > CLIENT_STALE_TIMEOUT_MS) {
+                            log(username + " disconnected (heartbeat timeout)");
+                            return;
+                        }
+                        continue;
+                    }
 
                     if (type.equals("PING")) {
                         send(stream -> {
                     stream.writeUTF("PONG");
                     });
                         continue;
+                    }
+
+                    if (type.equals("LOGOUT")) {
+                        log(username + " disconnected");
+                        return; // выходим из run, закрываем соединение
                     }
 
                     if (type.equals("AES_KEY")) {
@@ -1106,40 +1173,52 @@ public class Server extends JFrame {
                             }
                         }
                     } else if (type.equals("DOWNLOAD_FILE")) {
-                        String fileName = in.readUTF();
-                        if (isForbiddenDownloadFileName(fileName)) {
+                        String requestedFile = in.readUTF();
+                        if (isForbiddenDownloadFileName(requestedFile)) {
                             send(stream -> stream.writeUTF("DOWNLOAD_FAILED"));
                             continue;
                         }
-                        File file = new File(serverFilesDir, fileName);
+                        File file = new File(serverFilesDir, requestedFile);
 
                         if (!file.exists() || !file.isFile() || !isInsideServerFilesDir(file)) {
                             send(stream -> stream.writeUTF("DOWNLOAD_FAILED"));
                             continue;
                         }
 
-                        byte[] data = new byte[(int) file.length()];
-                        try (FileInputStream fis = new FileInputStream(file)) {
-                            fis.read(data);
+                        long fileSize = file.length();
+                        if (fileSize < 0 || fileSize > MAX_INCOMING_FILE_BYTES) {
+                            send(stream -> stream.writeUTF("DOWNLOAD_FAILED"));
+                            continue;
                         }
 
                         send(stream -> {
                             stream.writeUTF("DOWNLOAD_FILE");
                             stream.writeUTF(file.getName());
-                            stream.writeLong(data.length);
-                            stream.write(data);
+                            stream.writeLong(fileSize);
+                            try (FileInputStream fis = new FileInputStream(file)) {
+                                transferFixedBytes(fis, stream, fileSize);
+                            }
                         });
                     } else if (type.equals("FILE")) {
-                        String fileName = in.readUTF();
+                        String rawFileName = in.readUTF();
+                        String fileName = normalizeIncomingFileName(rawFileName);
                         long size = in.readLong();
-
-                        byte[] data = new byte[(int) size];
-                        in.readFully(data);
+                        if (size < 0) {
+                            continue;
+                        }
+                        if (size > MAX_INCOMING_FILE_BYTES) {
+                            log("File rejected (too large): " + rawFileName + " from " + username);
+                            return;
+                        }
+                        if (fileName == null) {
+                            skipIncomingBytes(in, size);
+                            continue;
+                        }
 
                         File serverFile =
                                 new File(serverFilesDir, username + "_" + fileName);
                         try (FileOutputStream fos = new FileOutputStream(serverFile)) {
-                            fos.write(data);
+                            transferFixedBytes(in, fos, size);
                         }
 
                         for (ClientHandler c : clientsById.values()) {
@@ -1149,7 +1228,9 @@ public class Server extends JFrame {
                                     stream.writeUTF(username);
                                     stream.writeUTF(fileName);
                                     stream.writeLong(size);
-                                    stream.write(data);
+                                    try (FileInputStream fis = new FileInputStream(serverFile)) {
+                                        transferFixedBytes(fis, stream, size);
+                                    }
                                 });
                             } catch (IOException ignored) {}
                         }

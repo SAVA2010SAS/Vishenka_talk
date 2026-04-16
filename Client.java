@@ -7,12 +7,22 @@ import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.*;
 import javax.sound.sampled.*;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 
 public class Client extends JFrame {
+    private static final int FILE_IO_BUFFER_SIZE = 64 * 1024;
+    private static final int MAX_FILES_PER_PICK = 100;
+    private static final long MAX_UPLOAD_FILE_BYTES = 512L * 1024 * 1024;
+    private static final long MAX_INCOMING_FILE_BYTES = 2L * 1024 * 1024 * 1024;
+    private static final long HEARTBEAT_INTERVAL_MS = 15_000L;
+    private static final long HEARTBEAT_TIMEOUT_MS = 45_000L;
 
     private JTextArea chatArea = new JTextArea();
     private JTextField inputField = new JTextField();
@@ -70,13 +80,23 @@ public class Client extends JFrame {
     private Clip messageReceivedSound;
     private Clip incomingCallSound;
     private boolean soundsLoaded = false;
+    private final ExecutorService fileTransferExecutor =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "file-upload-worker");
+                t.setDaemon(true);
+                return t;
+            });
+    private final AtomicBoolean heartbeatRunning = new AtomicBoolean(false);
+    private final AtomicBoolean shuttingDown = new AtomicBoolean(false);
+    private volatile long lastPongAtMs = 0L;
+    private Thread heartbeatThread;
 
     public Client() {
 
         setTitle("ВишенкаЧат");
         setSize(760, 520);
         setMinimumSize(new Dimension(680, 460));
-        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
         setLocationRelativeTo(null);
 
         Color windowBg = new Color(233, 236, 240);
@@ -383,8 +403,13 @@ public class Client extends JFrame {
         inviteToConversationBtn.addActionListener(e -> inviteToConversation());
         renameConversationBtn.addActionListener(e -> renameConversation());
 
-        // Load sounds
         loadSounds();
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                shutdownAndExit();
+            }
+        });
 
         SwingUtilities.invokeLater(this::showAuthDialog);
     }
@@ -491,14 +516,106 @@ public class Client extends JFrame {
         void write(DataOutputStream stream) throws IOException;
     }
 
-    private void sendCommand(StreamWriter writer) {
-        if (out == null) return;
-        synchronized (out) {
+    private boolean sendCommandInternal(StreamWriter writer, boolean reconnectOnError) {
+        DataOutputStream stream = out;
+        if (stream == null) return false;
+        synchronized (stream) {
             try {
-                writer.write(out);
-                out.flush();
+                if (stream != out) {
+                    return false;
+                }
+                writer.write(stream);
+                stream.flush();
+                return true;
+            } catch (IOException e) {
+                if (reconnectOnError) {
+                    SwingUtilities.invokeLater(() -> {
+                        if (shuttingDown.get()) {
+                            return;
+                        }
+                        chatArea.append("Потеря связи. Переподключение...\n");
+                        closeConnection();
+                        showAuthDialog();
+                    });
+                }
+                return false;
+            }
+        }
+    }
+
+    private void sendCommand(StreamWriter writer) {
+        sendCommandInternal(writer, true);
+    }
+
+    private void sendLogoutBestEffort() {
+        DataOutputStream stream = out;
+        if (stream == null) return;
+        synchronized (stream) {
+            try {
+                if (stream != out) {
+                    return;
+                }
+                stream.writeUTF("LOGOUT");
+                stream.flush();
             } catch (IOException ignored) {}
         }
+    }
+
+    private void startHeartbeat() {
+        stopHeartbeat();
+        heartbeatRunning.set(true);
+        lastPongAtMs = System.currentTimeMillis();
+        heartbeatThread = new Thread(() -> {
+            while (heartbeatRunning.get()) {
+                try {
+                    Thread.sleep(HEARTBEAT_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    break;
+                }
+                if (!heartbeatRunning.get()) {
+                    break;
+                }
+                if (out == null) {
+                    continue;
+                }
+                long now = System.currentTimeMillis();
+                if (lastPongAtMs > 0 && now - lastPongAtMs > HEARTBEAT_TIMEOUT_MS) {
+                    SwingUtilities.invokeLater(() -> {
+                        if (shuttingDown.get()) {
+                            return;
+                        }
+                        chatArea.append("Сервер не отвечает. Переподключение...\n");
+                        closeConnection();
+                        showAuthDialog();
+                    });
+                    break;
+                }
+                sendCommand(stream -> stream.writeUTF("PING"));
+            }
+            heartbeatRunning.set(false);
+        }, "heartbeat-thread");
+        heartbeatThread.setDaemon(true);
+        heartbeatThread.start();
+    }
+
+    private void stopHeartbeat() {
+        heartbeatRunning.set(false);
+        Thread thread = heartbeatThread;
+        heartbeatThread = null;
+        if (thread != null) {
+            thread.interrupt();
+        }
+    }
+
+    private void shutdownAndExit() {
+        if (!shuttingDown.compareAndSet(false, true)) {
+            return;
+        }
+        sendLogoutBestEffort();
+        closeConnection();
+        fileTransferExecutor.shutdownNow();
+        dispose();
+        System.exit(0);
     }
 
     private void requestServerFiles() {
@@ -601,11 +718,12 @@ public class Client extends JFrame {
             sc.init(null, tmf.getTrustManagers(), null);
 
             SSLSocketFactory ssf = sc.getSocketFactory();
-            socket = (SSLSocket) ssf.createSocket("tcp.cloudpub.ru", 62035);
+            socket = (SSLSocket) ssf.createSocket("tcp.cloudpub.ru", 16098);
             socket.setKeepAlive(true);
+            socket.setTcpNoDelay(true);
 
-            in = new DataInputStream(socket.getInputStream());
-            out = new DataOutputStream(socket.getOutputStream());
+            in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), FILE_IO_BUFFER_SIZE));
+            out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), FILE_IO_BUFFER_SIZE));
             return true;
         } catch (IOException | KeyManagementException | KeyStoreException | NoSuchAlgorithmException | CertificateException e) {
             JOptionPane.showMessageDialog(this, "Connection failed");
@@ -614,6 +732,8 @@ public class Client extends JFrame {
     }
 
     private void closeConnection() {
+        stopHeartbeat();
+        stopAudioStreams();
         try {
             if (socket != null) socket.close();
         } catch (Exception ignored) {}
@@ -664,7 +784,10 @@ public class Client extends JFrame {
             chatArea.append("Connected as " + username + "\n");
         }
         chatArea.append("Введите ID собеседника и нажмите \"Открыть чат\".\n");
-        new Thread(this::listen).start();
+        Thread listenerThread = new Thread(this::listen, "socket-listener");
+        listenerThread.setDaemon(true);
+        listenerThread.start();
+        startHeartbeat();
     }
 
     private void readServerPublicKey() throws IOException {
@@ -697,6 +820,7 @@ public class Client extends JFrame {
                 return false;
             }
             if ("LOGIN_OK".equals(response)) {
+                shuttingDown.set(false);
                 username = in.readUTF();
                 selfUserId = in.readUTF();
                 userIdField.setText(selfUserId);
@@ -732,6 +856,7 @@ public class Client extends JFrame {
                 return false;
             }
             if ("LOGIN_OK".equals(response)) {
+                shuttingDown.set(false);
                 username = in.readUTF();
                 selfUserId = in.readUTF();
                 userIdField.setText(selfUserId);
@@ -1124,27 +1249,96 @@ public class Client extends JFrame {
     }
 
     private void sendFile() {
-        try {
-            JFileChooser chooser = new JFileChooser();
-            if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION)
-                return;
+        JFileChooser chooser = new JFileChooser();
+        chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
+        chooser.setMultiSelectionEnabled(true);
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
+            return;
+        }
 
-            File file = chooser.getSelectedFile();
-            byte[] data = new byte[(int) file.length()];
-
-            try (FileInputStream fis = new FileInputStream(file)) {
-                fis.read(data);
+        File[] selected = chooser.getSelectedFiles();
+        if (selected == null || selected.length == 0) {
+            File single = chooser.getSelectedFile();
+            if (single != null) {
+                selected = new File[]{single};
             }
+        }
+        if (selected == null || selected.length == 0) {
+            return;
+        }
 
-            sendCommand(stream -> {
-                stream.writeUTF("FILE");
-                stream.writeUTF(file.getName());
-                stream.writeLong(data.length);
-                stream.write(data);
-            });
+        if (selected.length > MAX_FILES_PER_PICK) {
+            JOptionPane.showMessageDialog(this,
+                    "Слишком много файлов за раз. Отправляю первые " + MAX_FILES_PER_PICK + ".");
+            selected = java.util.Arrays.copyOf(selected, MAX_FILES_PER_PICK);
+        }
 
-        } catch (Exception e) {
-            JOptionPane.showMessageDialog(this, "File send error");
+        int queued = 0;
+        for (File file : selected) {
+            if (queueFileUpload(file)) {
+                queued++;
+            }
+        }
+        if (queued > 0) {
+            chatArea.append("[file] Добавлено в очередь: " + queued + "\n");
+        }
+    }
+
+    private boolean queueFileUpload(File file) {
+        if (file == null || !file.isFile()) {
+            return false;
+        }
+        long size = file.length();
+        if (size <= 0) {
+            JOptionPane.showMessageDialog(this, "Файл пустой: " + file.getName());
+            return false;
+        }
+        if (size > MAX_UPLOAD_FILE_BYTES) {
+            JOptionPane.showMessageDialog(this,
+                    "Файл слишком большой (макс " + (MAX_UPLOAD_FILE_BYTES / (1024 * 1024)) + " МБ): " + file.getName());
+            return false;
+        }
+
+        try {
+            fileTransferExecutor.execute(() -> uploadFileInBackground(file, size));
+            return true;
+        } catch (RejectedExecutionException e) {
+            JOptionPane.showMessageDialog(this, "Очередь отправки занята, попробуйте позже");
+            return false;
+        }
+    }
+
+    private void uploadFileInBackground(File file, long size) {
+        if (out == null) {
+            SwingUtilities.invokeLater(() ->
+                    chatArea.append("[file] Нет соединения: " + file.getName() + "\n"));
+            return;
+        }
+
+        SwingUtilities.invokeLater(() ->
+                chatArea.append("[file] Отправка: " + file.getName() + "\n"));
+
+        boolean sent = sendCommandInternal(stream -> {
+            stream.writeUTF("FILE");
+            stream.writeUTF(file.getName());
+            stream.writeLong(size);
+            try (FileInputStream fis = new FileInputStream(file)) {
+                byte[] buffer = new byte[FILE_IO_BUFFER_SIZE];
+                long remaining = size;
+                while (remaining > 0) {
+                    int read = fis.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                    if (read < 0) {
+                        throw new EOFException("Unexpected end of file while reading " + file.getName());
+                    }
+                    stream.write(buffer, 0, read);
+                    remaining -= read;
+                }
+            }
+        }, true);
+
+        if (sent) {
+            SwingUtilities.invokeLater(() ->
+                    chatArea.append("[file] Отправлен: " + file.getName() + "\n"));
         }
     }
 
@@ -1380,39 +1574,58 @@ public class Client extends JFrame {
         }
     }
 
-   private void listen() {
-    // Запускаем поток для пинга один раз
-    new Thread(() -> {
-        while (true) {
-            try {
-                Thread.sleep(35000);
-                if (out != null) {
-                    out.writeUTF("PING");
-                    out.flush();
+    private String normalizeFileName(String fileName) {
+        if (fileName == null || fileName.trim().isEmpty()) {
+            return "file.bin";
+        }
+        String baseName = new File(fileName).getName();
+        if (baseName.trim().isEmpty()) {
+            return "file.bin";
+        }
+        return baseName.replace('\n', '_').replace('\r', '_');
+    }
+
+    private File receiveFileToDownloads(DataInputStream stream, String outputFileName, long size) throws IOException {
+        if (size < 0 || size > MAX_INCOMING_FILE_BYTES) {
+            throw new IOException("Unsupported incoming file size: " + size);
+        }
+        File file = new File(downloadsDir, normalizeFileName(outputFileName));
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            byte[] buffer = new byte[FILE_IO_BUFFER_SIZE];
+            long remaining = size;
+            while (remaining > 0) {
+                int read = stream.read(buffer, 0, (int) Math.min(buffer.length, remaining));
+                if (read < 0) {
+                    throw new EOFException("Connection closed while receiving file");
                 }
-            } catch (Exception e) {
-                break;
+                fos.write(buffer, 0, read);
+                remaining -= read;
             }
         }
-    }).start();
+        return file;
+    }
 
-    try {
-        while (true) {
-            String type = in.readUTF();
-
-            // ✅ Обработка PONG — просто игнорируем, но сбрасываем таймауты
-            if (type.equals("PONG")) {
-                continue;
-            }
+    private void listen() {
+        try {
+            while (true) {
+                DataInputStream stream = in;
+                if (stream == null) {
+                    throw new EOFException("No active stream");
+                }
+                String type = stream.readUTF();
+                if (type.equals("PONG")) {
+                    lastPongAtMs = System.currentTimeMillis();
+                    continue;
+                }
 
             if (type.equals("MSG")) {
-                in.readUTF();
-                in.readUTF();
+                stream.readUTF();
+                stream.readUTF();
                 continue;
             } else if (type.equals("PRIVATE")) {
-                String senderId = in.readUTF();
-                String recipientId = in.readUTF();
-                String text = in.readUTF();
+                String senderId = stream.readUTF();
+                String recipientId = stream.readUTF();
+                String text = stream.readUTF();
                 String otherId = senderId.equals(selfUserId) ? recipientId : senderId;
                 if (otherId != null && otherId.equals(currentChatId)) {
                     if (senderId.equals(selfUserId)) {
@@ -1425,25 +1638,25 @@ public class Client extends JFrame {
                     playMessageReceivedSound();
                 }
             } else if (type.equals("CHAT_HISTORY")) {
-                int count = in.readInt();
+                int count = stream.readInt();
                 chatArea.setText("");
                 String header = currentChatId == null ? "Чат" : displayNameForId(currentChatId);
                 chatArea.append("---- " + header + " ----\n");
                 for (int i = 0; i < count; i++) {
-                    chatArea.append(in.readUTF() + "\n");
+                    chatArea.append(stream.readUTF() + "\n");
                 }
                 chatArea.append("----------------------\n");
             } else if (type.equals("Ошибка загрузки")) {
                 JOptionPane.showMessageDialog(this, "Файл не найден");
             } else if (type.equals("SERVER_FILES_LIST")) {
-                int count = in.readInt();
+                int count = stream.readInt();
                 if (count == 0) {
                     JOptionPane.showMessageDialog(this, "Нет файлов на сервере");
                     continue;
                 }
                 String[] files = new String[count];
                 for (int i = 0; i < count; i++) {
-                    files[i] = in.readUTF();
+                    files[i] = stream.readUTF();
                 }
                 String selected = (String) JOptionPane.showInputDialog(
                         this,
@@ -1455,42 +1668,31 @@ public class Client extends JFrame {
                         files[0]
                 );
                 if (selected != null) {
-                    sendCommand(stream -> {
-                        stream.writeUTF("DOWNLOAD_FILE");
-                        stream.writeUTF(selected);
+                    sendCommand(outStream -> {
+                        outStream.writeUTF("DOWNLOAD_FILE");
+                        outStream.writeUTF(selected);
                     });
                 }
             } else if (type.equals("DOWNLOAD_FILE")) {
-                String fileName = in.readUTF();
-                long size = in.readLong();
-                byte[] data = new byte[(int) size];
-                in.readFully(data);
-                File file = new File(downloadsDir, fileName);
-                try (FileOutputStream fos = new FileOutputStream(file)) {
-                    fos.write(data);
-                }
+                String fileName = stream.readUTF();
+                long size = stream.readLong();
+                File file = receiveFileToDownloads(stream, fileName, size);
                 JOptionPane.showMessageDialog(this,
                         "Скачено: " + file.getName());
             } else if (type.equals("DOWNLOAD_FAILED")) {
                 JOptionPane.showMessageDialog(this, "Файл не найден");
             } else if (type.equals("FILE")) {
-                String sender = in.readUTF();
-                String fileName = in.readUTF();
-                long size = in.readLong();
-                byte[] data = new byte[(int) size];
-                in.readFully(data);
-                File file =
-                        new File(downloadsDir, sender + "_" + fileName);
-                try (FileOutputStream fos = new FileOutputStream(file)) {
-                    fos.write(data);
-                }
+                String sender = stream.readUTF();
+                String fileName = stream.readUTF();
+                long size = stream.readLong();
+                File file = receiveFileToDownloads(stream, sender + "_" + fileName, size);
                 chatArea.append(sender + " sent file: " + file.getName() + "\n");
             } else if (type.equals("USERS_LIST")) {
-                int count = in.readInt();
+                int count = stream.readInt();
                 for (int i = 0; i < count; i++) {
-                    String id = in.readUTF();
-                    String name = in.readUTF();
-                    String status = in.readUTF();
+                    String id = stream.readUTF();
+                    String name = stream.readUTF();
+                    String status = stream.readUTF();
                     userStatuses.put(id, status);
                     if (name != null && !name.isEmpty()) {
                         userNamesById.put(id, name);
@@ -1498,13 +1700,13 @@ public class Client extends JFrame {
                 }
                 rebuildUsersList();
             } else if (type.equals("CONVERSATIONS_LIST")) {
-                int count = in.readInt();
+                int count = stream.readInt();
                 conversationNamesById.clear();
                 conversationCreatorsById.clear();
                 for (int i = 0; i < count; i++) {
-                    String id = in.readUTF();
-                    String name = in.readUTF();
-                    String creator = in.readUTF();
+                    String id = stream.readUTF();
+                    String name = stream.readUTF();
+                    String creator = stream.readUTF();
                     if (id == null || id.trim().isEmpty()) {
                         continue;
                     }
@@ -1517,12 +1719,12 @@ public class Client extends JFrame {
                 rebuildUsersList();
                 updateConversationControls();
             } else if (type.equals("FRIENDS_LIST")) {
-                int count = in.readInt();
+                int count = stream.readInt();
                 friends.clear();
                 for (int i = 0; i < count; i++) {
-                    String id = in.readUTF();
-                    String name = in.readUTF();
-                    String status = in.readUTF();
+                    String id = stream.readUTF();
+                    String name = stream.readUTF();
+                    String status = stream.readUTF();
                     friends.add(id);
                     userStatuses.put(id, status);
                     if (name != null && !name.isEmpty()) {
@@ -1531,9 +1733,9 @@ public class Client extends JFrame {
                 }
                 rebuildUsersList();
             } else if (type.equals("STATUS_UPDATE")) {
-                String id = in.readUTF();
-                String name = in.readUTF();
-                String status = in.readUTF();
+                String id = stream.readUTF();
+                String name = stream.readUTF();
+                String status = stream.readUTF();
                 userStatuses.put(id, status);
                 if (name != null && !name.isEmpty()) {
                     userNamesById.put(id, name);
@@ -1541,9 +1743,9 @@ public class Client extends JFrame {
                 chatArea.append("[status] " + displayNameForId(id) + " is " + status.toLowerCase() + "\n");
                 rebuildUsersList();
             } else if (type.equals("CONVERSATION_CREATED")) {
-                String id = in.readUTF();
-                String name = in.readUTF();
-                String creator = in.readUTF();
+                String id = stream.readUTF();
+                String name = stream.readUTF();
+                String creator = stream.readUTF();
                 String normalizedId = normalizeConversationId(id);
                 conversationNamesById.put(normalizedId, name == null ? normalizedId : name);
                 if (creator != null && !creator.isEmpty()) {
@@ -1552,9 +1754,9 @@ public class Client extends JFrame {
                 rebuildUsersList();
                 setActiveChat(normalizedId);
             } else if (type.equals("CONVERSATION_ADDED")) {
-                String id = in.readUTF();
-                String name = in.readUTF();
-                String creator = in.readUTF();
+                String id = stream.readUTF();
+                String name = stream.readUTF();
+                String creator = stream.readUTF();
                 String normalizedId = normalizeConversationId(id);
                 conversationNamesById.put(normalizedId, name == null ? normalizedId : name);
                 if (creator != null && !creator.isEmpty()) {
@@ -1564,8 +1766,8 @@ public class Client extends JFrame {
                 JOptionPane.showMessageDialog(this,
                         "Вас добавили в беседу: " + displayNameForId(normalizedId));
             } else if (type.equals("CONVERSATION_NAME_UPDATED")) {
-                String id = in.readUTF();
-                String newName = in.readUTF();
+                String id = stream.readUTF();
+                String newName = stream.readUTF();
                 String normalizedId = normalizeConversationId(id);
                 if (newName != null && !newName.trim().isEmpty()) {
                     conversationNamesById.put(normalizedId, newName);
@@ -1575,9 +1777,9 @@ public class Client extends JFrame {
                     requestChatHistory(normalizedId);
                 }
             } else if (type.equals("CONVERSATION_MSG")) {
-                String conversationId = normalizeConversationId(in.readUTF());
-                String senderId = in.readUTF();
-                String text = in.readUTF();
+                String conversationId = normalizeConversationId(stream.readUTF());
+                String senderId = stream.readUTF();
+                String text = stream.readUTF();
                 if (conversationId != null && conversationId.equals(currentChatId)) {
                     chatArea.append(displayNameForId(senderId) + ": " + text + "\n");
                 }
@@ -1585,27 +1787,27 @@ public class Client extends JFrame {
                     playMessageReceivedSound();
                 }
             } else if (type.equals("CONVERSATION_HISTORY")) {
-                String conversationId = normalizeConversationId(in.readUTF());
-                int count = in.readInt();
+                String conversationId = normalizeConversationId(stream.readUTF());
+                int count = stream.readInt();
                 if (conversationId != null && conversationId.equals(currentChatId)) {
                     chatArea.setText("");
                     String header = displayNameForId(conversationId);
                     chatArea.append("---- " + header + " ----\n");
                     for (int i = 0; i < count; i++) {
-                        chatArea.append(in.readUTF() + "\n");
+                        chatArea.append(stream.readUTF() + "\n");
                     }
                     chatArea.append("----------------------\n");
                 } else {
                     for (int i = 0; i < count; i++) {
-                        in.readUTF();
+                        stream.readUTF();
                     }
                 }
             } else if (type.equals("CONVERSATION_FAILED")) {
-                String reason = in.readUTF();
+                String reason = stream.readUTF();
                 JOptionPane.showMessageDialog(this, reason);
             } else if (type.equals("FRIEND_ADDED")) {
-                String id = in.readUTF();
-                String name = in.readUTF();
+                String id = stream.readUTF();
+                String name = stream.readUTF();
                 friends.add(id);
                 if (name != null && !name.isEmpty()) {
                     userNamesById.put(id, name);
@@ -1615,40 +1817,44 @@ public class Client extends JFrame {
                 JOptionPane.showMessageDialog(this,
                         "Добавлен в друзья: " + displayNameForId(id));
             } else if (type.equals("FRIEND_FAILED")) {
-                String reason = in.readUTF();
+                String reason = stream.readUTF();
                 JOptionPane.showMessageDialog(this, reason);
             } else if (type.equals("AUDIO_FRAME")) {
-                int length = in.readInt();
+                int length = stream.readInt();
                 byte[] audio = new byte[length];
-                in.readFully(audio);
+                stream.readFully(audio);
                 playAudio(audio, length);
             } else if (type.equals("CALL_INVITE")) {
-                String caller = in.readUTF();
+                String caller = stream.readUTF();
                 handleIncomingCall(caller);
             } else if (type.equals("CALL_ESTABLISHED")) {
-                String peer = in.readUTF();
+                String peer = stream.readUTF();
                 activeCallPeer = peer;
                 openCallWindow(peer);
                 chatArea.append("Звонок с " + displayNameForId(peer) + " начат\n");
             } else if (type.equals("CALL_ENDED")) {
-                String peer = in.readUTF();
+                String peer = stream.readUTF();
                 stopAudioStreams();
                 closeCallWindow();
                 chatArea.append("Звонок с " + displayNameForId(peer) + " завершён\n");
             } else if (type.equals("CALL_DECLINED")) {
-                String peer = in.readUTF();
+                String peer = stream.readUTF();
                 chatArea.append(displayNameForId(peer) + " отклонил звонок\n");
                 activeCallPeer = null;
             } else if (type.equals("CALL_BUSY")) {
-                String peer = in.readUTF();
+                String peer = stream.readUTF();
                 chatArea.append(displayNameForId(peer) + " занят\n");
                 activeCallPeer = null;
             } else if (type.equals("PRIVATE_FAILED")) {
-                String reason = in.readUTF();
+                String reason = stream.readUTF();
                 JOptionPane.showMessageDialog(this, reason);
             }
         }
     } catch (Exception e) {
+        if (shuttingDown.get()) {
+            return;
+        }
+        stopHeartbeat();
         chatArea.append("Отключено\n");
         updateStatusLabel(false);
         setControlsEnabled(false);
@@ -1663,12 +1869,16 @@ public class Client extends JFrame {
         rebuildUsersList();
         updatePinButton();
         updateConversationControls();
+        closeConnection();
 
         // автоматическое переп. через 5 секунд
         new Thread(() -> {
             try {
                 Thread.sleep(5000);
                 SwingUtilities.invokeLater(() -> {
+                    if (shuttingDown.get()) {
+                        return;
+                    }
                     chatArea.append("Попытка переподключения...\n");
                     showAuthDialog();
                 });
@@ -1677,18 +1887,7 @@ public class Client extends JFrame {
     }
 }
 
-    public static void main(String[] args) {
-        try {
-            for (UIManager.LookAndFeelInfo info : UIManager.getInstalledLookAndFeels()) {
-                if ("Nimbus".equals(info.getName())) {
-                    UIManager.setLookAndFeel(info.getClassName());
-                    break;
-                }
-            }
-            if (!"Nimbus".equals(UIManager.getLookAndFeel().getName())) {
-                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-            }
-        } catch (Exception ignored) {}
-        SwingUtilities.invokeLater(() -> new Client().setVisible(true));
-    }
+   public static void main(String[] args) {
+    SwingUtilities.invokeLater(() -> new Client().setVisible(true));
+}
 }
