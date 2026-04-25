@@ -16,7 +16,7 @@ import javax.sound.sampled.*;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 
-public class Client extends JFrame {
+public class Client extends JFrame{
     private static final int FILE_IO_BUFFER_SIZE = 64 * 1024;
     private static final int MAX_FILES_PER_PICK = 100;
     private static final long MAX_UPLOAD_FILE_BYTES = 512L * 1024 * 1024;
@@ -75,7 +75,7 @@ public class Client extends JFrame {
     private String selfUserId;
     private String currentChatId;
 
-    // Sound clips
+    // звуки
     private Clip messageSentSound;
     private Clip messageReceivedSound;
     private Clip incomingCallSound;
@@ -718,7 +718,7 @@ public class Client extends JFrame {
             sc.init(null, tmf.getTrustManagers(), null);
 
             SSLSocketFactory ssf = sc.getSocketFactory();
-            socket = (SSLSocket) ssf.createSocket("tcp.cloudpub.ru", 16098);
+            socket = (SSLSocket) ssf.createSocket("tcp.cloudpub.ru", 62035);
             socket.setKeepAlive(true);
             socket.setTcpNoDelay(true);
 

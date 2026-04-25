@@ -3,11 +3,14 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.security.KeyPair;
 import java.security.KeyStore;
+import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
 import javax.net.ssl.*;
 import javax.swing.*;
 
@@ -16,6 +19,10 @@ public class Server extends JFrame {
     private static final int SOCKET_IDLE_CHECK_MS = 30_000;
     private static final long CLIENT_STALE_TIMEOUT_MS = 90_000L;
     private static final long MAX_INCOMING_FILE_BYTES = 2L * 1024 * 1024 * 1024;
+    private static final String PASSWORD_HASH_ALGORITHM = "PBKDF2WithHmacSHA256";
+    private static final int PASSWORD_HASH_ITERATIONS = 120_000;
+    private static final int PASSWORD_SALT_BYTES = 16;
+    private static final int PASSWORD_HASH_BYTES = 32;
 
     private final JTextArea logArea = new JTextArea();
     private SSLServerSocket serverSocket;
@@ -25,7 +32,8 @@ public class Server extends JFrame {
     private final ConcurrentHashMap<String, ClientHandler> clientsById = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> userStatuses = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> activeCalls = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, String> userPasswords = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> userPasswordSalts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> userPasswordHashes = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> userIdsByUsername = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, String> usernameByUserId = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, java.util.Set<String>> friendsByUserId =
@@ -72,12 +80,14 @@ public class Server extends JFrame {
     private static class UserRecord {
         private final String id;
         private final String username;
-        private final String password;
+        private final String passwordSalt;
+        private final String passwordHash;
 
-        private UserRecord(String id, String username, String password) {
+        private UserRecord(String id, String username, String passwordSalt, String passwordHash) {
             this.id = id;
             this.username = username;
-            this.password = password;
+            this.passwordSalt = passwordSalt;
+            this.passwordHash = passwordHash;
         }
     }
 
@@ -143,28 +153,50 @@ public class Server extends JFrame {
                 if (parts.length < 2) continue;
                 String id;
                 String user;
-                String pass;
-                if (parts.length >= 3) {
+                String salt;
+                String hash;
+                if (parts.length >= 4) {
                     id = parts[0].trim();
                     user = parts[1].trim();
-                    pass = parts[2].trim();
+                    salt = parts[2].trim();
+                    hash = parts[3].trim();
+                } else if (parts.length >= 3) {
+                    id = parts[0].trim();
+                    user = parts[1].trim();
+                    String plainPassword = parts[2].trim();
+                    String[] salted = buildSaltedPassword(plainPassword);
+                    if (salted == null) {
+                        log("Users DB read error: cannot hash legacy password for user " + user);
+                        continue;
+                    }
+                    salt = salted[0];
+                    hash = salted[1];
+                    needsRewrite = true;
                 } else {
                     user = parts[0].trim();
-                    pass = parts[1].trim();
+                    String plainPassword = parts[1].trim();
                     id = generateUserId();
+                    String[] salted = buildSaltedPassword(plainPassword);
+                    if (salted == null) {
+                        log("Users DB read error: cannot hash legacy password for user " + user);
+                        continue;
+                    }
+                    salt = salted[0];
+                    hash = salted[1];
                     needsRewrite = true;
                 }
-                if (user.isEmpty() || pass.isEmpty()) continue;
-                if (userPasswords.containsKey(user)) continue;
+                if (user.isEmpty() || salt.isEmpty() || hash.isEmpty()) continue;
+                if (userPasswordHashes.containsKey(user)) continue;
                 if (usernameByUserId.containsKey(id)) {
                     id = generateUserId();
                     needsRewrite = true;
                 }
-                userPasswords.put(user, pass);
+                userPasswordSalts.put(user, salt);
+                userPasswordHashes.put(user, hash);
                 userIdsByUsername.put(user, id);
                 usernameByUserId.put(id, user);
                 userStatuses.putIfAbsent(id, false);
-                records.add(new UserRecord(id, user, pass));
+                records.add(new UserRecord(id, user, salt, hash));
             }
         } catch (IOException e) {
             log("Users DB read error: " + e.getMessage());
@@ -176,18 +208,26 @@ public class Server extends JFrame {
 
     private String registerUser(String user, String pass) {
         synchronized (usersLock) {
-            if (userPasswords.containsKey(user)) {
+            if (userPasswordHashes.containsKey(user)) {
                 return null;
             }
+            String[] salted = buildSaltedPassword(pass);
+            if (salted == null) {
+                return null;
+            }
+            String salt = salted[0];
+            String hash = salted[1];
             String id = generateUserId();
-            userPasswords.put(user, pass);
+            userPasswordSalts.put(user, salt);
+            userPasswordHashes.put(user, hash);
             userIdsByUsername.put(user, id);
             usernameByUserId.put(id, user);
             userStatuses.put(id, false);
             try (FileWriter writer = new FileWriter(usersDb, true)) {
-                writer.write(id + "\t" + user + "\t" + pass + "\n");
+                writer.write(id + "\t" + user + "\t" + salt + "\t" + hash + "\n");
             } catch (IOException e) {
-                userPasswords.remove(user, pass);
+                userPasswordSalts.remove(user, salt);
+                userPasswordHashes.remove(user, hash);
                 userIdsByUsername.remove(user, id);
                 usernameByUserId.remove(id, user);
                 return null;
@@ -200,11 +240,75 @@ public class Server extends JFrame {
         synchronized (usersLock) {
             try (FileWriter writer = new FileWriter(usersDb, false)) {
                 for (UserRecord record : records) {
-                    writer.write(record.id + "\t" + record.username + "\t" + record.password + "\n");
+                    writer.write(record.id + "\t" + record.username + "\t"
+                            + record.passwordSalt + "\t" + record.passwordHash + "\n");
                 }
             } catch (IOException e) {
                 log("Users DB rewrite error: " + e.getMessage());
             }
+        }
+    }
+
+    private String[] buildSaltedPassword(String plainPassword) {
+        if (plainPassword == null || plainPassword.isEmpty()) {
+            return null;
+        }
+        String saltBase64 = generateSaltBase64();
+        if (saltBase64 == null) {
+            return null;
+        }
+        String hashBase64 = hashPassword(plainPassword, saltBase64);
+        if (hashBase64 == null) {
+            return null;
+        }
+        return new String[]{saltBase64, hashBase64};
+    }
+
+    private String generateSaltBase64() {
+        byte[] salt = new byte[PASSWORD_SALT_BYTES];
+        idRandom.nextBytes(salt);
+        return java.util.Base64.getEncoder().encodeToString(salt);
+    }
+
+    private String hashPassword(String plainPassword, String saltBase64) {
+        if (plainPassword == null || saltBase64 == null || saltBase64.isEmpty()) {
+            return null;
+        }
+        try {
+            byte[] salt = java.util.Base64.getDecoder().decode(saltBase64);
+            PBEKeySpec spec = new PBEKeySpec(
+                    plainPassword.toCharArray(),
+                    salt,
+                    PASSWORD_HASH_ITERATIONS,
+                    PASSWORD_HASH_BYTES * 8
+            );
+            byte[] hashBytes;
+            try {
+                SecretKeyFactory factory = SecretKeyFactory.getInstance(PASSWORD_HASH_ALGORITHM);
+                hashBytes = factory.generateSecret(spec).getEncoded();
+            } finally {
+                spec.clearPassword();
+            }
+            return java.util.Base64.getEncoder().encodeToString(hashBytes);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean verifyPassword(String plainPassword, String saltBase64, String expectedHashBase64) {
+        if (plainPassword == null || expectedHashBase64 == null || expectedHashBase64.isEmpty()) {
+            return false;
+        }
+        String actualHashBase64 = hashPassword(plainPassword, saltBase64);
+        if (actualHashBase64 == null) {
+            return false;
+        }
+        try {
+            byte[] expected = java.util.Base64.getDecoder().decode(expectedHashBase64);
+            byte[] actual = java.util.Base64.getDecoder().decode(actualHashBase64);
+            return MessageDigest.isEqual(expected, actual);
+        } catch (IllegalArgumentException e) {
+            return false;
         }
     }
 
@@ -423,7 +527,7 @@ public class Server extends JFrame {
                 conversationHistory.computeIfAbsent(conversationId,
                         k -> java.util.Collections.synchronizedList(new java.util.ArrayList<>()));
         list.add(new HistoryEntry(false, senderId, conversationId, encryptedBody));
-        if (list.size() > 10000000) {
+        if (list.size() > 100000) {
             list.remove(0);
         }
     }
@@ -693,8 +797,9 @@ public class Server extends JFrame {
                     String user = in.readUTF();
                     String pass = in.readUTF();
                     String trimmedUser = resolveUsername(user);
-                    String stored = userPasswords.get(trimmedUser);
-                    if (stored == null || !stored.equals(pass)) {
+                    String salt = userPasswordSalts.get(trimmedUser);
+                    String storedHash = userPasswordHashes.get(trimmedUser);
+                    if (!verifyPassword(pass, salt, storedHash)) {
                         send(stream -> {
                             stream.writeUTF("LOGIN_FAILED");
                             stream.writeUTF("Invalid username or password");
